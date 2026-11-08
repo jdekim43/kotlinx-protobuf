@@ -35,6 +35,9 @@ class TestProject(val root: File) {
         write("gradle.properties", "org.gradle.jvmargs=-Xmx2g")
     }
 
+    /** The Gradle a test needs instead of the one this build runs on, for plugins that lag behind it. */
+    var gradleVersion: String? = null
+
     fun write(path: String, content: String): File = root.resolve(path).apply {
         parentFile.mkdirs()
         writeText(content.trimIndent() + "\n")
@@ -53,6 +56,7 @@ class TestProject(val root: File) {
         .withProjectDir(root)
         .withArguments(*arguments, "--stacktrace")
         .forwardOutput()
+        .apply { gradleVersion?.let { withGradleVersion(it) } }
 
     companion object {
 

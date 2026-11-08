@@ -1,8 +1,12 @@
 package kim.jade.kotlinx.protobuf.gradle
 
+import kim.jade.kotlinx.protobuf.gradle.internal.AndroidJavaWiring
 import kim.jade.kotlinx.protobuf.gradle.internal.CatalogEntry
 import kim.jade.kotlinx.protobuf.gradle.internal.GeneratorCatalog
 import kim.jade.kotlinx.protobuf.gradle.internal.ProtocPlatform
+import kim.jade.kotlinx.protobuf.gradle.internal.onlyWhen
+import kim.jade.kotlinx.protobuf.gradle.internal.unwiredDirectory
+import kim.jade.kotlinx.protobuf.gradle.internal.whenConfigured
 import kim.jade.kotlinx.protobuf.gradle.task.ExtractProtoIncludesTask
 import kim.jade.kotlinx.protobuf.gradle.task.GenerateProtoDescriptorSetTask
 import kim.jade.kotlinx.protobuf.gradle.task.GenerateProtoTask
@@ -534,9 +538,9 @@ class KotlinxProtobufPlugin : Plugin<Project> {
             it.outputDirectory.get().dir(generator.outputSubDirectory.getOrElse(generator.name))
         }
 
-        if (spec.wireGeneratedSources.get()) {
-            sourceSet.kotlin.srcDir(outputDirectory)
-        }
+        sourceSet.kotlin.srcDir(
+            spec.wireGeneratedSources.flatMap { wired -> if (wired) outputDirectory else project.unwiredDirectory() }
+        )
 
         if (entry != null) {
             registerRequiredProtocOutputs(project, extension, spec, entry)
@@ -651,37 +655,150 @@ class KotlinxProtobufPlugin : Plugin<Project> {
         target: Property<ProtocOutputTarget>,
         directory: Provider<Directory>,
     ) {
-        if (spec.wireGeneratedSources.get() && enabled.get()) {
+        // Every setting is read lazily. `builtin("java") { wireToNothing() }` creates the spec with
+        // maybeCreate and only then runs the action, while this method runs from builtins.all { } — on
+        // creation — so a value read here eagerly is always the convention, never what the build set.
+        fun isWiredTo(vararg accepted: ProtocOutputTarget): Provider<Boolean> =
+            spec.wireGeneratedSources
+                .zip(enabled) { wire, on -> wire && on }
+                .zip(target.orElse(ProtocOutputTarget.BOTH)) { on, chosen -> on && chosen in accepted }
 
+        // flatMap keeps the generate task as the producer, so consumers still depend on it. srcDir needs one
+        // directory, never a list, hence the nonexistent stand-in when the output is not wired.
+        fun Provider<Boolean>.directoryWhenTrue(): Provider<Directory> =
+            flatMap { wired -> if (wired) directory else project.unwiredDirectory() }
+
+        sourceSet.kotlin.srcDir(isWiredTo(ProtocOutputTarget.KOTLIN, ProtocOutputTarget.BOTH).directoryWhenTrue())
+
+        val javaWired = isWiredTo(ProtocOutputTarget.JAVA, ProtocOutputTarget.BOTH)
+        // BOTH means "wherever it fits", and a Kotlin-only output with nowhere to compile Java is normal,
+        // so only an explicit JAVA is worth a warning.
+        val explicitlyJava = isWiredTo(ProtocOutputTarget.JAVA)
+        val outputDescription = "the '$name' protoc output for '${spec.name}'"
+
+        val attached = if (project.plugins.hasPlugin(KOTLIN_MULTIPLATFORM_PLUGIN)) {
+            attachJavaToMultiplatformCompilations(
+                project, spec, name, outputDescription, sourceSet, javaWired, explicitlyJava, directory,
+            )
+        } else {
             val javaSourceSet = project.extensions.findByType(SourceSetContainer::class.java)?.let {
                 it.findByName(spec.kotlinSourceSetName.get()) ?: it.findByName("main")
             }
+            javaSourceSet?.java?.srcDir(javaWired.directoryWhenTrue())
+            project.provider { javaSourceSet != null }
+        }
 
-            when (target.getOrElse(ProtocOutputTarget.BOTH)) {
-                ProtocOutputTarget.NONE -> Unit
-
-                ProtocOutputTarget.KOTLIN -> sourceSet.kotlin.srcDir(directory)
-
-                ProtocOutputTarget.BOTH -> {
-                    sourceSet.kotlin.srcDir(directory)
-                    // No warning: BOTH means "wherever it fits", and a Kotlin-only output in a project
-                    // without Java sources is perfectly normal.
-                    javaSourceSet?.java?.srcDir(directory)
-                }
-
-                ProtocOutputTarget.JAVA -> {
-                    if (javaSourceSet == null) {
-                        project.logger.warn(
-                            "kotlinx-protobuf: the '$name' protoc output for '${spec.name}' is Java, but this " +
-                                "project has no Java source set to compile it. Apply the java plugin, or set " +
-                                "wireTo = ProtocOutputTarget.NONE when the output is only used through copyToSrc."
-                        )
-                    } else {
-                        javaSourceSet.java.srcDir(directory)
-                    }
-                }
+        project.whenConfigured {
+            if (explicitlyJava.get() && !attached.get()) {
+                project.logger.warn(
+                    "kotlinx-protobuf: $outputDescription is Java, but no compilation of this project can " +
+                        "compile Java. Add a JVM or Android target, or set wireTo = ProtocOutputTarget.NONE " +
+                        "when the output is only used through copyToSrc."
+                )
             }
         }
+    }
+
+    /**
+     * Hands Java output on a multiplatform source set to every JVM and Android compilation that includes
+     * it. JS and Native compilations never see it, so `commonMain` can carry the `java` builtin in a
+     * project that also targets them.
+     *
+     * Only javac's inputs are touched: both a JVM target's Kotlin compilation and AGP's hand kotlinc the
+     * Java sources of their compilation for symbol resolution already. Adding the directory to a Kotlin
+     * source set too would compile anything else in it twice once `wireTo` is BOTH.
+     *
+     * Returns whether any compilation could take the output, for the warning.
+     */
+    private fun attachJavaToMultiplatformCompilations(
+        project: Project,
+        spec: ProtoSourceSetSpec,
+        protocOutputName: String,
+        outputDescription: String,
+        sourceSet: KotlinSourceSet,
+        javaWired: Provider<Boolean>,
+        explicitlyJava: Provider<Boolean>,
+        directory: Provider<Directory>,
+    ): Provider<Boolean> {
+        val kotlin = project.extensions.getByName(KOTLIN_EXTENSION) as KotlinTargetsContainer
+
+        // Whether a compilation includes the source set is only known once the hierarchy is set up, after
+        // the build script, so each decision sits inside a provider.
+        kotlin.targets.matching { it.platformType == KotlinPlatformType.jvm }.all { target ->
+            target.compilations.all { compilation ->
+                // Since Kotlin 2.1.20 every JVM target compilation owns a Java source set of the same name.
+                project.extensions.findByType(SourceSetContainer::class.java)
+                    ?.matching { it.name == compilation.defaultSourceSet.name }
+                    ?.all { javaSourceSet ->
+                        javaSourceSet.java.srcDir(
+                            project.onlyWhen({
+                                javaWired.get() && sourceSet in compilation.allKotlinSourceSets
+                            }, directory)
+                        )
+                    }
+            }
+        }
+
+        // AGP compiles from its own variants, not from Kotlin's source sets, so the output goes there too.
+        ANDROID_PLUGINS.forEach { id ->
+            project.plugins.withId(id) {
+                attachJavaToAndroidVariants(
+                    project, spec, protocOutputName, outputDescription, sourceSet, javaWired, explicitlyJava,
+                    directory,
+                )
+            }
+        }
+
+        return project.provider {
+            kotlin.targets.any {
+                it.platformType == KotlinPlatformType.jvm || it.platformType == KotlinPlatformType.androidJvm
+            }
+        }
+    }
+
+    private fun attachJavaToAndroidVariants(
+        project: Project,
+        spec: ProtoSourceSetSpec,
+        protocOutputName: String,
+        outputDescription: String,
+        sourceSet: KotlinSourceSet,
+        javaWired: Provider<Boolean>,
+        explicitlyJava: Provider<Boolean>,
+        directory: Provider<Directory>,
+    ) {
+        val kotlinSourceSets = (project.extensions.getByName(KOTLIN_EXTENSION) as KotlinSourceSetContainer).sourceSets
+
+        // AGP creates its variants before KGP creates the Android compilations — and, under the KMP library
+        // plugin, before KGP fills in the source set hierarchy — so inclusion is read off the Kotlin source
+        // set each AGP component compiles, and only once AGP's tasks actually need it.
+        fun includedBy(vararg kotlinNames: String): () -> Boolean = {
+            kotlinNames.any { name ->
+                val root = kotlinSourceSets.findByName(name)
+                root != null && (root == sourceSet || sourceSet in root.dependsOnClosure())
+            }
+        }
+
+        AndroidJavaWiring.attach(
+            project = project,
+            description = outputDescription,
+            taskNamePrefix = "expose${spec.name.capitalized()}${protocOutputName.capitalized()}For",
+            directory = directory,
+            wired = { javaWired.get() },
+            includedInMain = includedBy(ANDROID_MAIN_SOURCE_SET),
+            // androidUnitTest under androidTarget(); androidHostTest under the KMP library plugin.
+            includedInUnitTest = includedBy(ANDROID_UNIT_TEST_SOURCE_SET, ANDROID_HOST_TEST_SOURCE_SET),
+            warnWithoutJava = { explicitlyJava.get() },
+        )
+    }
+
+    private fun KotlinSourceSet.dependsOnClosure(): Set<KotlinSourceSet> {
+        val seen = mutableSetOf<KotlinSourceSet>()
+        val queue = ArrayDeque(dependsOn)
+        while (queue.isNotEmpty()) {
+            val next = queue.removeFirst()
+            if (seen.add(next)) queue.addAll(next.dependsOn)
+        }
+        return seen
     }
 
     private fun forEachKotlinPlugin(project: Project, action: () -> Unit) {
@@ -709,6 +826,14 @@ class KotlinxProtobufPlugin : Plugin<Project> {
 
         const val KOTLIN_MULTIPLATFORM_PLUGIN = "org.jetbrains.kotlin.multiplatform"
         const val KOTLIN_JVM_PLUGIN = "org.jetbrains.kotlin.jvm"
+        val ANDROID_PLUGINS = listOf(
+            "com.android.library",
+            "com.android.application",
+            "com.android.kotlin.multiplatform.library",
+        )
+        const val ANDROID_MAIN_SOURCE_SET = "androidMain"
+        const val ANDROID_UNIT_TEST_SOURCE_SET = "androidUnitTest"
+        const val ANDROID_HOST_TEST_SOURCE_SET = "androidHostTest"
 
         const val PROTOC_CONFIGURATION = "kotlinxProtobufProtoc"
         const val PROTO_PATH_CONFIGURATION = "kotlinxProtobufProtoPath"

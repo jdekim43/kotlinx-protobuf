@@ -17,7 +17,10 @@ enum class ProtocOutputTarget {
     /** Add the output directory to the source set's Kotlin sources. */
     KOTLIN,
 
-    /** Add it to the Java sources. Warns when the project has no Java source set to compile them. */
+    /**
+     * Add it to the Java sources: the `java` plugin's source set, or in a multiplatform project every JVM
+     * and Android compilation that includes the source set. Warns when nothing can compile Java.
+     */
     JAVA,
 
     /**
