@@ -54,6 +54,8 @@ dependencies {
     // compileOnly, and the -api artifact only: depending on the full Kotlin Gradle Plugin would force a
     // KGP version on every consumer of this plugin.
     compileOnly(kt.kotlin.gradlePlugin.api)
+    // Only loaded when a project applies AGP; see AndroidJavaWiring.
+    compileOnly("com.android.tools.build:gradle-api:8.13.2")
 
     testImplementation(gradleTestKit())
     testImplementation(libs.kotest.framework.engine)

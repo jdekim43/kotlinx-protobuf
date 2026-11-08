@@ -659,8 +659,12 @@ kotlin.sourceSets.named("<name>") {
 ```
 
 Generated Kotlin lands on the `kotlin` source directory set of the source set the spec lives on. Java
-from the `java` builtin goes to the JVM target's Java source set, which Kotlin 2.1+ compiles without
-`withJava()`.
+from the `java` builtin goes to every JVM and Android compilation that includes that source set — the
+JVM target's Java source set, which Kotlin 2.1+ compiles without `withJava()`, and each Android variant —
+and to no JS or Native one. So `commonMain` can carry `builtin("java")` in a project that also targets
+JavaScript, and an Android + desktop library needs no `java` plugin and no hand-written wiring. Under
+`com.android.kotlin.multiplatform.library`, call `withJava()` on the Android target, or it compiles no
+Java at all.
 
 ### protoc builtins and plugins
 
